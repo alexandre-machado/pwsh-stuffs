@@ -10,20 +10,29 @@ function send-notify {
     $balloon.ShowBalloonTip(5000)
 }
 
-$time = Get-VM WinDev2308Eval | Select-Object -ExpandProperty Uptime
+function get-time($name) {
+    return Get-VM $name | Select-Object -ExpandProperty Uptime
+}
+
+param(
+    $name
+)
+
+$startTime = get-time $name
 $val = $True
 
-Write-Host "time is: $time"
+Write-Host "time is: $startTime"
 while ($val -eq $True) {
-    if ($time -ge (Get-VM 'WinDev2308Eval' | Select-Object -ExpandProperty Uptime)) {
-        Write-Host "uptime: $(Get-VM 'WinDev2308Eval' | Select-Object -ExpandProperty Uptime)"
+    $partialTime = get-time $name
+    if ($startTime -ge ($partialTime)) {
+        Write-Host "uptime: $($partialTime)"
         send-notify
         # $val = $False
     }
     else {
-        Write-Host "uptime: $(Get-VM 'WinDev2308Eval' | Select-Object -ExpandProperty Uptime)"
+        Write-Host "uptime: $($partialTime)"
         # $val = $False
     }
-    $time = Get-VM WinDev2308Eval | Select-Object -ExpandProperty Uptime
+    $startTime = $partialTime
     Start-Sleep -Seconds 2
 }

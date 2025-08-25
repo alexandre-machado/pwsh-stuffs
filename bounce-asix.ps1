@@ -1,70 +1,65 @@
-<# bounce-asix.ps1 — tries Windows 'sudo' before classic self-elevation
-   Purpose: when run without privileges, first tries to relaunch itself via `sudo` (Windows 11)
-   and, if not available/fails, uses Start-Process -Verb RunAs (classic self-elevation).
+<#
+reset-usb-hub.ps1
+------------------
+Script para "reviver" adaptador ASIX que some do barramento USB após hibernação/sleep.
+
+1. Procura por um adaptador ASIX ativo (quando existir).
+2. Descobre o dispositivo PnP pai do tipo USB Hub e salva seu InstanceId em cache.
+3. Se o ASIX não for encontrado, tenta ler o cache e reinicia o hub pai.
+4. Como fallback, executa pnputil /scan-devices para forçar redescoberta.
+
+Requer: privilégios de administrador.
 #>
 
-### ----------------------
-### 1) Conditional elevation
-### ----------------------
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $self = $MyInvocation.MyCommand.Path
-    if (-not $self) { throw "Could not resolve script path (MyCommand.Path is empty)." }
+$cacheDir = Join-Path $env:LOCALAPPDATA "BounceAsix"
+$cacheFile = Join-Path $cacheDir "parent.id"
+if (-not (Test-Path $cacheDir)) { New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null }
 
-    $wd = (Get-Location).Path
-    $scriptArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$self`""
-
-    # 1a) Tentar 'sudo' do Windows (se existir) para elevar mantendo o diretório
-    $sudoCmd = Get-Command sudo -ErrorAction SilentlyContinue
-    if ($sudoCmd) {
-        try {
-            # sudo accepts the full command as argument
-            Start-Process -FilePath $sudoCmd.Source -ArgumentList "pwsh $scriptArgs" -WorkingDirectory $wd -WindowStyle Hidden
-            exit 0
-        } catch {
-            Write-Host "Failed to use 'sudo' (Windows). Trying classic self-elevation..." -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "'sudo' command not found. Proceeding to classic self-elevation..." -ForegroundColor Yellow
-    }
-
-    # 1b) Fallback: auto-elevação clássica (pwsh; se não houver, powershell)
-    try {
-        Start-Process pwsh -Verb RunAs -ArgumentList $scriptArgs -WorkingDirectory $wd -WindowStyle Hidden
-    } catch {
-        Start-Process powershell -Verb RunAs -ArgumentList $scriptArgs -WorkingDirectory $wd -WindowStyle Hidden
-    }
-    exit 0
+function Get-AsixDevice {
+    Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -like "*ASIX*" -or $_.InstanceId -like "*VID_0B95*" }
 }
 
-### ----------------------
-### 2) Main script: "bounce" ASIX adapter after resume
-### ----------------------
-### Strategy: locate adapters whose Description contains "ASIX" and are not Disabled;
-### disable, wait 2s, and re-enable. If none found, script does not fail.
+function Get-ParentHubId($dev) {
+    $parent = Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName "DEVPKEY_Device_Parent" -ErrorAction SilentlyContinue
+    while ($parent) {
+        $p = Get-PnpDevice -InstanceId $parent.Data -ErrorAction SilentlyContinue
+        if ($p -and $p.Class -eq "USB" -and $p.FriendlyName -like "*Hub*") {
+            return $p.InstanceId
+        }
+        $parent = Get-PnpDeviceProperty -InstanceId $parent.Data -KeyName "DEVPKEY_Device_Parent" -ErrorAction SilentlyContinue
+    }
+    return $null
+}
 
 try {
-    $ifs = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*ASIX*" -and $_.Status -ne "Disabled" }
-} catch {
-    Write-Error "Failed to enumerate adapters. Run in Windows PowerShell/PowerShell with networking modules available."
-    exit 1
-}
-
-if (-not $ifs) {
-    Write-Host "No active ASIX adapter found. Nothing to do." -ForegroundColor DarkYellow
-    exit 0
-}
-
-foreach ($if in $ifs) {
-    Write-Host "Restarting adapter: $($if.Name) — $($if.InterfaceDescription)" -ForegroundColor Cyan
-    try {
-        Disable-NetAdapter -InterfaceDescription $if.InterfaceDescription -Confirm:$false -PassThru | Out-Null
-        Start-Sleep -Seconds 2
-        Enable-NetAdapter  -InterfaceDescription $if.InterfaceDescription -Confirm:$false -PassThru | Out-Null
-        Write-Host "OK: $($if.Name) reactivated." -ForegroundColor Green
-    } catch {
-        Write-Error "Failed to restart '$($if.Name)': $($_.Exception.Message)"
+    $asix = Get-AsixDevice
+    if ($asix) {
+        Write-Host "ASIX presente: $($asix.FriendlyName)" -ForegroundColor Green
+        $hubId = Get-ParentHubId $asix
+        if ($hubId) {
+            Set-Content -Path $cacheFile -Value $hubId -Encoding UTF8
+            Write-Host "Cache atualizado com HubId: $hubId" -ForegroundColor Cyan
+        } else {
+            Write-Host "Não consegui identificar o Hub pai." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "ASIX não encontrado. Tentando usar cache..." -ForegroundColor Yellow
+        if (Test-Path $cacheFile) {
+            $hubId = Get-Content $cacheFile -Raw
+            if ($hubId) {
+                Write-Host "Reiniciando Hub: $hubId" -ForegroundColor Magenta
+                Disable-PnpDevice -InstanceId $hubId -Confirm:$false -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+                Enable-PnpDevice  -InstanceId $hubId -Confirm:$false -ErrorAction SilentlyContinue
+            } else {
+                Write-Host "Cache vazio, não há HubId salvo." -ForegroundColor Red
+            }
+        } else {
+            Write-Host "Sem cache salvo. Forçando rescan de dispositivos..." -ForegroundColor DarkYellow
+            pnputil /scan-devices | Out-Null
+        }
     }
 }
-
-# End
+catch {
+    Write-Error $_
+}

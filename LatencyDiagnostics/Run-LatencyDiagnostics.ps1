@@ -6,11 +6,25 @@ param(
     [int]$WprDurationSeconds = 30,
     [int]$PauseSeconds = 0,
     [switch]$InteractivePause,
-    [switch]$IncludeExtraCounters = $true,
-    [switch]$CollectNetworkAdvanced = $true,
-    [switch]$CollectDiskInfo = $true,
-    [switch]$CollectServices = $true
+    [bool]$IncludeExtraCounters,
+    [bool]$CollectNetworkAdvanced,
+    [bool]$CollectNetworkStats,
+    [bool]$CollectSystemEvents,
+    [bool]$CollectSecurityState,
+    [bool]$CollectProcessIO,
+    [bool]$CollectDiskInfo,
+    [bool]$CollectServices
 )
+
+# Set default toggles when not explicitly provided
+if (-not $PSBoundParameters.ContainsKey('IncludeExtraCounters'))   { $IncludeExtraCounters   = $true }
+if (-not $PSBoundParameters.ContainsKey('CollectNetworkAdvanced')) { $CollectNetworkAdvanced = $true }
+if (-not $PSBoundParameters.ContainsKey('CollectNetworkStats'))    { $CollectNetworkStats    = $true }
+if (-not $PSBoundParameters.ContainsKey('CollectDiskInfo'))        { $CollectDiskInfo        = $true }
+if (-not $PSBoundParameters.ContainsKey('CollectServices'))        { $CollectServices        = $true }
+if (-not $PSBoundParameters.ContainsKey('CollectSystemEvents'))    { $CollectSystemEvents    = $false }
+if (-not $PSBoundParameters.ContainsKey('CollectSecurityState'))   { $CollectSecurityState   = $false }
+if (-not $PSBoundParameters.ContainsKey('CollectProcessIO'))       { $CollectProcessIO       = $false }
 
 function New-StampFolder($base, $prefix) {
     $ts = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -81,6 +95,17 @@ function New-SystemSnapshot {
         }
     }
 
+    if ($CollectNetworkStats) {
+        Write-Host "Collecting network adapter statistics..." -ForegroundColor Yellow
+        try {
+            $netStats = Get-NetAdapterStatistics -Name * -ErrorAction Stop |
+                Select-Object Name, ReceivedBytes, SentBytes, ReceivedUnicastPackets, SentUnicastPackets, ReceivedBroadcastPackets, SentBroadcastPackets, ReceivedMulticastPackets, SentMulticastPackets
+            Save-Csv $netStats (Join-Path $Folder "network-stats.csv")
+        } catch {
+            Write-Host "Failed to collect network stats: $_" -ForegroundColor DarkYellow
+        }
+    }
+
     if ($CollectDiskInfo) {
         Write-Host "Collecting physical disk info..." -ForegroundColor Yellow
         try {
@@ -116,6 +141,63 @@ function New-SystemSnapshot {
             Save-Csv $extra.CounterSamples (Join-Path $Folder "extra-counters.csv")
         } catch {
             Write-Host "Failed to collect extra counters: $_" -ForegroundColor DarkYellow
+        }
+    }
+
+    if ($CollectSystemEvents) {
+        Write-Host "Collecting system events (NDIS/Storport/USB/WHEA)..." -ForegroundColor Yellow
+        try {
+            $events = Get-WinEvent -LogName System -MaxEvents 500 -ErrorAction Stop |
+                Where-Object { $_.ProviderName -and ($_.ProviderName -match 'NDIS|storport|USB|WHEA') } |
+                Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message
+            Save-Csv $events (Join-Path $Folder "system-events.csv")
+        } catch {
+            Write-Host "Failed to collect system events: $_" -ForegroundColor DarkYellow
+        }
+    }
+
+    if ($CollectSecurityState) {
+        Write-Host "Collecting security & hypervisor state..." -ForegroundColor Yellow
+        try {
+            $dg = Get-CimInstance -ClassName Win32_DeviceGuard -ErrorAction Stop
+            $dgRow = [pscustomobject]@{
+                SecurityServicesConfigured = ($dg.SecurityServicesConfigured -join ',')
+                SecurityServicesRunning   = ($dg.SecurityServicesRunning -join ',')
+            }
+            Save-Csv @($dgRow) (Join-Path $Folder "deviceguard.csv")
+        } catch {
+            Write-Host "Failed to collect DeviceGuard: $_" -ForegroundColor DarkYellow
+        }
+        try {
+            $hvLine = (bcdedit | Select-String -Pattern 'hypervisorlaunchtype').ToString()
+            $hvRow = [pscustomobject]@{ Key = 'hypervisorlaunchtype'; Value = $hvLine }
+            Save-Csv @($hvRow) (Join-Path $Folder "hypervisor.csv")
+        } catch {
+            Write-Host "Failed to query hypervisorlaunchtype: $_" -ForegroundColor DarkYellow
+        }
+    }
+
+    if ($CollectProcessIO) {
+        Write-Host "Collecting process IO and network top-talkers..." -ForegroundColor Yellow
+        try {
+            $procs = Get-Process | Select-Object Name, Id, IOReadBytes, IOWriteBytes
+            Save-Csv $procs (Join-Path $Folder "process-io.csv")
+        } catch {
+            Write-Host "Failed to collect process IO: $_" -ForegroundColor DarkYellow
+        }
+        try {
+            $conns = Get-NetTCPConnection -ErrorAction Stop
+            $group = $conns | Group-Object OwningProcess | Sort-Object Count -Descending
+            $map = @{}
+            foreach ($p in Get-Process) { $map[$p.Id] = $p.Name }
+            $rows = @()
+            foreach ($g in $group) {
+                $name = $map.ContainsKey($g.Name) ? $map[$g.Name] : ''
+                $rows += [pscustomobject]@{ OwningProcess = $g.Name; ProcessName = $name; ConnectionCount = $g.Count }
+            }
+            Save-Csv $rows (Join-Path $Folder "net-top-talkers.csv")
+        } catch {
+            Write-Host "Failed to collect network top talkers: $_" -ForegroundColor DarkYellow
         }
     }
 
@@ -345,6 +427,71 @@ function Compare-SystemSnapshots {
 
     $oldExtraPath = Join-Path $OldSnapshotPath "extra-counters.csv"
     $newExtraPath = Join-Path $NewSnapshotPath "extra-counters.csv"
+        $oldNetStatsPath = Join-Path $OldSnapshotPath "network-stats.csv"
+        $newNetStatsPath = Join-Path $NewSnapshotPath "network-stats.csv"
+        if ((Test-Path $oldNetStatsPath) -and (Test-Path $newNetStatsPath)) {
+            Write-Host "Comparing Network Stats..." -ForegroundColor Yellow
+            $oldNetStats = Import-Csv $oldNetStatsPath
+            $newNetStats = Import-Csv $newNetStatsPath
+            $netStatsDiff = Compare-ObjectsByKey -Old $oldNetStats -New $newNetStats -KeyProps @("Name") -ValueProps @("ReceivedBytes","SentBytes","ReceivedUnicastPackets","SentUnicastPackets") -Label "NetworkStats"
+            Save-CmpCsv $netStatsDiff "network-stats-diff.csv"
+            Add-Summary -Label "NetworkStats" -Diff $netStatsDiff
+        }
+
+        $oldEventsPath = Join-Path $OldSnapshotPath "system-events.csv"
+        $newEventsPath = Join-Path $NewSnapshotPath "system-events.csv"
+        if ((Test-Path $oldEventsPath) -and (Test-Path $newEventsPath)) {
+            Write-Host "Comparing System Events..." -ForegroundColor Yellow
+            $oldEvents = Import-Csv $oldEventsPath
+            $newEvents = Import-Csv $newEventsPath
+            $eventsDiff = Compare-ObjectsByKey -Old $oldEvents -New $newEvents -KeyProps @("TimeCreated","ProviderName","Id") -ValueProps @("LevelDisplayName") -Label "SystemEvents"
+            Save-CmpCsv $eventsDiff "system-events-diff.csv"
+            Add-Summary -Label "SystemEvents" -Diff $eventsDiff
+        }
+
+        $oldDGPath = Join-Path $OldSnapshotPath "deviceguard.csv"
+        $newDGPath = Join-Path $NewSnapshotPath "deviceguard.csv"
+        if ((Test-Path $oldDGPath) -and (Test-Path $newDGPath)) {
+            Write-Host "Comparing DeviceGuard..." -ForegroundColor Yellow
+            $oldDG = Import-Csv $oldDGPath
+            $newDG = Import-Csv $newDGPath
+            $dgDiff = Compare-ObjectsByKey -Old $oldDG -New $newDG -KeyProps @("SecurityServicesConfigured","SecurityServicesRunning") -ValueProps @() -Label "DeviceGuard"
+            Save-CmpCsv $dgDiff "deviceguard-diff.csv"
+            Add-Summary -Label "DeviceGuard" -Diff $dgDiff
+        }
+
+        $oldHvPath = Join-Path $OldSnapshotPath "hypervisor.csv"
+        $newHvPath = Join-Path $NewSnapshotPath "hypervisor.csv"
+        if ((Test-Path $oldHvPath) -and (Test-Path $newHvPath)) {
+            Write-Host "Comparing Hypervisor State..." -ForegroundColor Yellow
+            $oldHv = Import-Csv $oldHvPath
+            $newHv = Import-Csv $newHvPath
+            $hvDiff = Compare-ObjectsByKey -Old $oldHv -New $newHv -KeyProps @("Key") -ValueProps @("Value") -Label "Hypervisor"
+            Save-CmpCsv $hvDiff "hypervisor-diff.csv"
+            Add-Summary -Label "Hypervisor" -Diff $hvDiff
+        }
+
+        $oldTopTalkersPath = Join-Path $OldSnapshotPath "net-top-talkers.csv"
+        $newTopTalkersPath = Join-Path $NewSnapshotPath "net-top-talkers.csv"
+        if ((Test-Path $oldTopTalkersPath) -and (Test-Path $newTopTalkersPath)) {
+            Write-Host "Comparing Network Top Talkers..." -ForegroundColor Yellow
+            $oldTT = Import-Csv $oldTopTalkersPath
+            $newTT = Import-Csv $newTopTalkersPath
+            $ttDiff = Compare-ObjectsByKey -Old $oldTT -New $newTT -KeyProps @("OwningProcess") -ValueProps @("ConnectionCount","ProcessName") -Label "NetTopTalkers"
+            Save-CmpCsv $ttDiff "net-top-talkers-diff.csv"
+            Add-Summary -Label "NetTopTalkers" -Diff $ttDiff
+        }
+
+        $oldProcIoPath = Join-Path $OldSnapshotPath "process-io.csv"
+        $newProcIoPath = Join-Path $NewSnapshotPath "process-io.csv"
+        if ((Test-Path $oldProcIoPath) -and (Test-Path $newProcIoPath)) {
+            Write-Host "Comparing Process IO..." -ForegroundColor Yellow
+            $oldPIO = Import-Csv $oldProcIoPath
+            $newPIO = Import-Csv $newProcIoPath
+            $pioDiff = Compare-ObjectsByKey -Old $oldPIO -New $newPIO -KeyProps @("Id","Name") -ValueProps @("IOReadBytes","IOWriteBytes") -Label "ProcessIO"
+            Save-CmpCsv $pioDiff "process-io-diff.csv"
+            Add-Summary -Label "ProcessIO" -Diff $pioDiff
+        }
     if ((Test-Path $oldExtraPath) -and (Test-Path $newExtraPath)) {
         Write-Host "Comparing Extra Counters..." -ForegroundColor Yellow
         $oldExtra = Import-Csv $oldExtraPath
@@ -391,6 +538,12 @@ function Build-AnalysisJson {
     $diskDiff        = LoadOrNull (Join-Path $CompareFolder "disk-diff.csv")
     $servicesDiff    = LoadOrNull (Join-Path $CompareFolder "services-diff.csv")
     $extraCountersDiff = LoadOrNull (Join-Path $CompareFolder "extra-counters-diff.csv")
+    $netStatsDiff    = LoadOrNull (Join-Path $CompareFolder "network-stats-diff.csv")
+    $eventsDiff      = LoadOrNull (Join-Path $CompareFolder "system-events-diff.csv")
+    $deviceGuardDiff = LoadOrNull (Join-Path $CompareFolder "deviceguard-diff.csv")
+    $hypervisorDiff  = LoadOrNull (Join-Path $CompareFolder "hypervisor-diff.csv")
+    $topTalkersDiff  = LoadOrNull (Join-Path $CompareFolder "net-top-talkers-diff.csv")
+    $processIoDiff   = LoadOrNull (Join-Path $CompareFolder "process-io-diff.csv")
 
     $suspectDrivers = @()
     if ($driversDiff) {
@@ -555,6 +708,12 @@ function Build-AnalysisJson {
             disk = $diskDiff
             services = $servicesDiff
             extraCounters = $extraCountersDiff
+            networkStats = $netStatsDiff
+            systemEvents = $eventsDiff
+            deviceGuard = $deviceGuardDiff
+            hypervisor = $hypervisorDiff
+            netTopTalkers = $topTalkersDiff
+            processIO = $processIoDiff
         }
         suspectedDrivers = $suspectDrivers
         isrDpcSpikes = $spikes

@@ -1,59 +1,140 @@
 param(
+    [Parameter(Mandatory)]
     [string] $user,
+
+    [Parameter(Mandatory)]
     [string] $pass,
-    [string] $Port = 554,
+    [int] $Port = 554,
     [string] $Path = "/stream1",
-    [string] $vlcPath = "$Env:ProgramFiles\VideoLAN\VLC\vlc.exe"
+    [string] $vlcPath = "$Env:ProgramFiles\VideoLAN\VLC\vlc.exe",
+    [int] $CacheSize = 10,
+    [string] $CachePath = $(Join-Path -Path $PSScriptRoot -ChildPath ".open-all-my-cans.cache.json")
 )
 
-if (Test-Path $vlcPath) {
-    Write-Host "O VLC está instalado." -ForegroundColor Green
-    Write-Host " -> $vlcPath" -ForegroundColor Cyan
-} else {
-    Write-Host "O VLC não está instalado." -ForegroundColor Red
+function Test-VlcPath {
+    param([string] $PathToCheck)
+    if (Test-Path $PathToCheck) {
+        Write-Host "O VLC esta instalado." -ForegroundColor Green
+        Write-Host " -> $PathToCheck" -ForegroundColor Cyan
+        return $true
+    }
+
+    Write-Host "O VLC nao esta instalado." -ForegroundColor Red
+    return $false
+}
+
+function Get-LocalIpv4Info {
+    $activeInterface = (Test-NetConnection).InterfaceAlias
+    return Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+        $_.InterfaceAlias -eq $activeInterface
+    } | Select-Object -First 1
+}
+
+function Get-IpRange {
+    param(
+        [string] $IPAddress,
+        [int] $PrefixLength
+    )
+
+    if ($PrefixLength -le 24) {
+        return 1..254
+    }
+
+    if ($PrefixLength -ge 31) {
+        return @()
+    }
+
+    [int] $lastOctet = [int]($IPAddress.Split('.')[-1])
+    [int] $subnetSize = [Math]::Pow(2, (32 - $PrefixLength))
+    [int] $subnetStart = [Math]::Floor($lastOctet / $subnetSize) * $subnetSize
+    [int] $firstHost = $subnetStart + 1
+    [int] $lastHost = $subnetStart + $subnetSize - 2
+
+    return $firstHost..$lastHost
+}
+
+function Read-IpCache {
+    param([string] $PathToCache)
+    if (-not (Test-Path $PathToCache)) {
+        return @()
+    }
+
+    try {
+        $content = Get-Content -Path $PathToCache -Raw
+        $data = $content | ConvertFrom-Json
+        if ($null -eq $data -or $null -eq $data.LastIps) {
+            return @()
+        }
+        return @($data.LastIps | Where-Object { $_ -and $_.Trim() -ne "" })
+    } catch {
+        return @()
+    }
+}
+
+function Write-IpCache {
+    param(
+        [string] $PathToCache,
+        [string[]] $IpsToSave,
+        [int] $MaxItems
+    )
+
+    if ($MaxItems -lt 1) {
+        return
+    }
+
+    $payload = [PSCustomObject]@{
+        LastIps = @($IpsToSave | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique | Select-Object -First $MaxItems)
+        UpdatedAt = (Get-Date).ToString("s")
+    }
+
+    $payload | ConvertTo-Json -Depth 2 | Set-Content -Path $PathToCache -Encoding UTF8
+}
+
+if (-not (Test-VlcPath -PathToCheck $vlcPath)) {
     exit
 }
 
-# Obter as informações de rede
-$IPInfo = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
-    $_.InterfaceAlias -eq (Test-NetConnection).InterfaceAlias
-})
-
-# Obter o endereço IP do computador
-$IPAddress = $IPInfo.IPAddress
-# Obter a máscara de sub-rede
-$SubnetMask = $IPInfo.PrefixLength
-# Calcular o prefixo do IP
-$IPPrefix = $IPAddress.Substring(0, $IPAddress.LastIndexOf("."))
-
-# Calcular o intervalo de IPs com base na máscara de sub-rede
-function Get-IPRange {
-    param (
-        [int] $PrefixLength
-    )
-    switch ($PrefixLength) {
-        24 { 1..254 }
-        25 { 1..126 }
-        26 { 1..62 }
-        27 { 1..30 }
-        28 { 1..14 }
-        29 { 1..6 }
-        30 { 1..2 }
-        default { 1..254 }
-    }
+$ipInfo = Get-LocalIpv4Info
+if ($null -eq $ipInfo) {
+    Write-Host "Could not detect a local IPv4 address." -ForegroundColor Red
+    exit
 }
 
-$IPRange = Get-IPRange -PrefixLength $SubnetMask
+$ipAddress = $ipInfo.IPAddress
+$subnetMask = $ipInfo.PrefixLength
+$ipPrefix = $ipAddress.Substring(0, $ipAddress.LastIndexOf("."))
+[int[]] $ipRange = @(Get-IpRange -IPAddress $ipAddress -PrefixLength $subnetMask)
+[string[]] $cachedIps = @(Read-IpCache -PathToCache $CachePath)
 
-Write-Host "[IPAddress]: $IPAddress [SubnetMask]: $SubnetMask [IPPrefix]: $IPPrefix [IPRange length]: $($IPRange.Length)" -ForegroundColor Green
+Write-Host "[IPAddress]: $ipAddress [SubnetMask]: $subnetMask [IPPrefix]: $ipPrefix [IPRange length]: $($ipRange.Length)" -ForegroundColor Green
 
-$IPRange | ForEach-Object -Parallel {
-    $FullIP = $using:IPPrefix + "." + $_
-    $url = "rtsp://" + $using:user + ":" + $using:pass + "@" + $FullIP + $using:Path
+[string[]] $scanIps = @($ipRange | ForEach-Object { "$ipPrefix.$_" })
+
+if ($cachedIps.Count -gt 0) {
+    Write-Host "Cache hit(s): $($cachedIps.Count). Trying them first." -ForegroundColor Yellow
+}
+
+[string[]] $ipQueue = @(
+    $cachedIps
+    $scanIps | Where-Object { $_ -notin $cachedIps }
+) | Where-Object { $_ }
+$foundIps = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
+$ipQueue | ForEach-Object -Parallel {
+    $fullIp = $_
+    $url = "rtsp://" + $using:user + ":" + $using:pass + "@" + $fullIp + ":" + $using:Port + $using:Path
     $arguments = @($url, "--zoom=0.5", "--loop", "--qt-minimal-view")
 
-    if (Test-NetConnection -ComputerName $FullIP -Port $using:Port -InformationLevel Quiet -WarningAction SilentlyContinue) {
-        Write-Host " -> Opening $FullIP : $using:Port" -ForegroundColor Cyan
+    if (Test-NetConnection -ComputerName $fullIp -Port $using:Port -InformationLevel Quiet -WarningAction SilentlyContinue) {
+        Write-Host " -> Opening $fullIp : $using:Port" -ForegroundColor Cyan
+        $foundIpsRef = $using:foundIps
+        $null = $foundIpsRef.Add($fullIp)
         Start-Process -FilePath $using:vlcPath -ArgumentList $arguments
     }
 } -ThrottleLimit 50
+
+Write-IpCache -PathToCache $CachePath -IpsToSave $foundIps.ToArray() -MaxItems $CacheSize
+
+if ($foundIps.Count -eq 0) {
+    Write-Host "No RTSP endpoints found. Check IP range, port, or credentials." -ForegroundColor Yellow
+}

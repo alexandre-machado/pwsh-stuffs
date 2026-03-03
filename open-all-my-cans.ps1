@@ -129,11 +129,26 @@ $ipQueue | ForEach-Object -Parallel {
         Write-Host " -> Opening $fullIp : $using:Port" -ForegroundColor Cyan
         $foundIpsRef = $using:foundIps
         $null = $foundIpsRef.Add($fullIp)
+
+        # Save cache immediately on each successful connection
+        $mutex = [System.Threading.Mutex]::new($false, "Global\OpenAllMyCans_CacheMutex")
+        try {
+            $null = $mutex.WaitOne()
+            $allFound = @($foundIpsRef.ToArray() | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique | Select-Object -First $using:CacheSize)
+            $payload = [PSCustomObject]@{
+                LastIps   = $allFound
+                UpdatedAt = (Get-Date).ToString("s")
+            }
+            $payload | ConvertTo-Json -Depth 2 | Set-Content -Path $using:CachePath -Encoding UTF8
+        }
+        finally {
+            $mutex.ReleaseMutex()
+            $mutex.Dispose()
+        }
+
         Start-Process -FilePath $using:vlcPath -ArgumentList $arguments
     }
 } -ThrottleLimit 50
-
-Write-IpCache -PathToCache $CachePath -IpsToSave $foundIps.ToArray() -MaxItems $CacheSize
 
 if ($foundIps.Count -eq 0) {
     Write-Host "No RTSP endpoints found. Check IP range, port, or credentials." -ForegroundColor Yellow
